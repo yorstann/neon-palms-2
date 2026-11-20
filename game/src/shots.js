@@ -1,79 +1,111 @@
-// The screenshot scenes behind ?shot=start|play|end. Each one plays the real rules forward from a
-// fresh world for a fixed number of steps, steered by a simple autopilot (look ahead each way the
-// paddle could move, keep clear of blocks, chase the lowest coin when that is safe), so the frame
-// is what a short game really looks like and the same seed always gives the same frame.
-import { FIELD, PLAYER, STEP } from './config.js';
-import { EVENT_OVER, KIND_BLOCK } from './world.js';
-import { SCREEN_OVER, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+// The screenshot scenes behind ?shot=title|downtown|chase|mission&seed=N.
+// Each builds the real world with the real rules, poses the actors, steps
+// the simulation a fixed number of ticks so traffic and crowds settle,
+// and leaves a living frame for the camera — the same seed always gives
+// the same Palmera Bay. main.js renders the staged frame and raises
+// window.__SHOT_READY once it is on screen.
+import { G } from './state.js';
+import { STEP } from './config.js';
+import { buildWorld } from './world.js';
+import { createCar } from './vehicles.js';
+import { updateTrafficCar, moveCar } from './vehicles.js';
+import { updatePeds, spawnPedAt } from './pedestrians.js';
+import { setHeat } from './police.js';
+import { FX } from './effects.js';
 
-const START_SECONDS = 5;
-const PLAY_SECONDS = 26;
-const END_LIMIT_SECONDS = 600;
-/**
- * How far ahead, in seconds, the autopilot checks each way it could move: the play scene's pilot
- * looks well ahead and keeps all its lives; the end scene's looks only a moment ahead, so it is
- * caught out once the blocks speed up, as a hurried player is.
- */
-const HORIZON_PLAY = 0.7;
-const HORIZON_END = 0.25;
-const SAMPLE = 1 / 30;
-const DIRECTIONS = [0, -1, 1];
-/** Extra room, each side, it keeps between the paddle and a block. */
-const MARGIN = 10;
-
-/** Seconds until moving in `direction` (-1, 0, 1) runs the paddle into a block; Infinity when it never does. */
-function timeToHit(state, direction, horizon) {
-  const player = state.player;
-  for (let t = SAMPLE; t <= horizon; t += SAMPLE) {
-    const x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * t));
-    for (let index = 0; index < state.items.length; index += 1) {
-      const item = state.items[index];
-      if (!item.active || item.kind !== KIND_BLOCK) continue;
-      const y = item.y + item.speed * t;
-      if (y + item.height > player.y && y < player.y + player.height && item.x < x + player.width + MARGIN && item.x + item.width > x - MARGIN) return t;
+function settle(steps) {
+  for (let i = 0; i < steps; i++) {
+    G.time += STEP;
+    for (const car of G.cars) {
+      if (car.driver === 'traffic') updateTrafficCar(car, STEP, G.rng);
+      else if (car.driver === 'police') moveCar(car, STEP);
     }
+    updatePeds(STEP, G.rng);
+    FX.update(STEP);
   }
-  return Infinity;
 }
 
-/** Of the safe ways to move, the one toward the lowest coin (or the centre); else the one that is hit last. */
-function autopilot(state, horizon) {
-  const player = state.player;
-  let coin = null;
-  for (let index = 0; index < state.items.length; index += 1) {
-    const item = state.items[index];
-    if (item.active && item.kind !== KIND_BLOCK && (coin === null || item.y > coin.y)) coin = item;
-  }
-  const target = coin === null ? FIELD.width / 2 : coin.x + coin.width / 2;
-  const centre = player.x + player.width / 2;
-  const wanted = target > centre + 8 ? 1 : target < centre - 8 ? -1 : 0;
-  let best = wanted;
-  let bestTime = timeToHit(state, wanted, horizon);
-  for (let index = 0; index < DIRECTIONS.length && bestTime !== Infinity; index += 1) {
-    const time = timeToHit(state, DIRECTIONS[index], horizon);
-    if (time > bestTime) {
-      bestTime = time;
-      best = DIRECTIONS[index];
-    }
-  }
-  return best;
+function placePlayerCar(type, x, y, angle, speed, color) {
+  const car = createCar(type, x, y, angle, color);
+  car.driver = 'player';
+  car.speed = speed;
+  G.cars.push(car);
+  G.player.state = 'car';
+  G.player.car = car;
+  G.player.x = x;
+  G.player.y = y;
+  return car;
 }
 
-/**
- * Set `world` to the named scene (start, play or end; any other name is start) and return the
- * screen to draw over it and the best score to show.
- */
-export function stageShot(name, world) {
-  world.reset();
-  if (name !== 'play' && name !== 'end') {
-    for (let index = 0; index < START_SECONDS / STEP; index += 1) world.step(STEP, 0, true);
-    return { screen: SCREEN_TITLE, best: 0 };
+export function stageShot(name, seed) {
+  buildWorld(seed || 1);
+  const p = G.player;
+
+  if (name === 'downtown') {
+    G.mode = 'play';
+    G.clockMin = 11 * 60 + 20;
+    // On the sidewalk corner of 1000 Avenue and 900 Street, mid-morning,
+    // with the lunch crowd around and traffic rolling past.
+    p.x = 1076; p.y = 976; p.angle = 0.4; p.aim = 0.4;
+    spawnPedAt(1010, 1006, G.rng);
+    spawnPedAt(1150, 838, G.rng);
+    spawnPedAt(946, 880, G.rng);
+    spawnPedAt(1120, 1090, G.rng);
+    G.camera.x = p.x; G.camera.y = p.y;
+    G.objective = 'Free roam — Palmera Bay';
+    settle(80);
+    G.camera.x = p.x; G.camera.y = p.y;
+    return;
   }
-  const limit = name === 'end' ? END_LIMIT_SECONDS : PLAY_SECONDS;
-  const horizon = name === 'end' ? HORIZON_END : HORIZON_PLAY;
-  for (let index = 0; index < limit / STEP; index += 1) {
-    if (world.step(STEP, autopilot(world.state, horizon), false) & EVENT_OVER) break;
+
+  if (name === 'chase') {
+    G.mode = 'play';
+    G.clockMin = 20 * 60 + 25;
+    const car = placePlayerCar('sport', 1480, 962, 0, 372, '#e03a5f');
+    const copSpots = [[1310, 1004, 0.06], [1180, 928, -0.05], [1605, 1012, 0.32]];
+    for (const [x, y, a] of copSpots) {
+      const cop = createCar('police', x, y, a, '#20242c');
+      cop.driver = 'police';
+      cop.speed = 330;
+      G.cars.push(cop);
+    }
+    setHeat(330); // three stars
+    G.lastCrimePos = { x: car.x, y: car.y };
+    for (let i = 0; i < 26; i++) {
+      const bx = car.x - i * 13;
+      FX.skid(bx, 962 + 10);
+      FX.skid(bx, 962 - 10);
+    }
+    G.objective = 'Lose the police — or find Shine & Go';
+    settle(24);
+    G.camera.x = car.x + 60;
+    G.camera.y = car.y;
+    return;
   }
-  const over = world.state.lives === 0;
-  return { screen: over ? SCREEN_OVER : SCREEN_PLAY, best: world.state.score };
+
+  if (name === 'mission') {
+    G.mode = 'play';
+    G.clockMin = 15 * 60 + 10;
+    const car = placePlayerCar('sedan', 430, 1400, 0, 120, '#4a7fb5');
+    G.missionsDone = 0;
+    G.marker = { x: 356, y: 1620, label: 'PICKUP' };
+    G.objective = 'Pick up the cooler at the Marina docks';
+    G.dialogue = {
+      lines: [{ who: 'Mara Voss', text: 'A cooler is waiting at the Marina docks, south-west corner. Bring it to the Downtown garage on 1500 Avenue. Do not open it.' }],
+      idx: 0, onDone: null,
+    };
+    settle(36);
+    G.camera.x = car.x + 130;
+    G.camera.y = car.y + 40;
+    return;
+  }
+
+  // title (and anything unknown): golden hour over the bay, world alive.
+  G.mode = 'title';
+  G.clockMin = 17 * 60 + 42;
+  G.camera.x = 760;
+  G.camera.y = 1180;
+  settle(110);
+  G.camera.x = 760;
+  G.camera.y = 1180;
 }
